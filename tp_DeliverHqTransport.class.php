@@ -14,19 +14,21 @@ class tp_DeliverHqTransport implements Swift_Transport
 
   const DELIVERHQ_URI = 'https://api.deliverhq.com/api/send.json';
 
-  public function __construct($uri=null)
+  public function __construct($uri = null, $username = null, $password = null)
   {
     $this->uri = is_null($uri) ? self::DELIVERHQ_URI : $uri;
+    $this->username = $username;
+    $this->password = $password;
   }
 
   public function setUsername($username)
   {
-    $this->username=$username;
+    $this->username = $username;
   }
 
   public function setPassword($password)
   {
-    $this->password=$password;
+    $this->password = $password;
   }
 
   public function isStarted()
@@ -45,6 +47,41 @@ class tp_DeliverHqTransport implements Swift_Transport
   }
 
   /**
+   * @param Swift_Mime_Message $message
+   * @param string $mime_type
+   * @return Swift_Mime_MimePart
+   */
+  protected function getMIMEPart(Swift_Mime_Message $message, $mimeType = 'text/html')
+  {
+    $mimePart = NULL;
+    foreach ($message->getChildren() as $part)
+    {
+      if (strpos($part->getContentType(), $mimeType) === 0)
+        $mimePart = $part;
+    }
+    return $mimePart;
+  }
+
+  protected function validate(Swift_Mime_Message $message)
+  {
+    if ($message->getBcc() != null)
+    {
+      throw new Swift_TransportException('BCC is not supported');
+    }
+
+    if ($message->getCc() != null)
+    {
+      throw new Swift_TransportException('CC is not supported');
+    }
+
+    if (count($message->getTo()) != 1)
+    {
+      throw new Swift_TransportException('only one TO address is supported');
+    }
+
+  }
+
+  /**
    * Sends the given message.
    *
    * @param Swift_Mime_Message $message
@@ -54,23 +91,67 @@ class tp_DeliverHqTransport implements Swift_Transport
    */
   public function send(Swift_Mime_Message $message, &$failedRecipients = array())
   {
+    $this->validate($message);
 
-    $fromAddresses=array_keys($message->getFrom());
+    $fromAddresses = array_keys($message->getFrom());
+
+    if (!isset($fromAddresses[0]))
+    {
+      throw new Swift_TransportException('from address must be set');
+    }
+
     $recipients = array_keys($message->getTo());
 
-    $this->identifiers=array();
+    $recipient = $message->getHeaders()->get('To')->getFieldBody();
+    $sender = $message->getHeaders()->get('From')->getFieldBody();
 
-    $successCounter=0;
+    $this->identifiers = array();
 
-    foreach ($recipients as $recipient)
+    $parameters = array('to' => $recipient,
+                        'from' => $sender,
+                        'subject' => $message->getSubject(),
+                        'plain_body' => $message->getBody());
+
+    if (!is_null($htmlPart = $this->getMIMEPart($message, 'text/html')))
     {
+      $parameters['html_body'] = $htmlPart->getBody();
+    }
 
-      $parameters = array('to' => $recipient,
-                          'from' => $fromAddresses[0],
-                          'subject' => $message->getSubject(),
-                          'plain_body' => $message->getBody()
-      );
+    $output = $this->sendToApi($parameters);
 
+    $response = json_decode($output, true);
+
+    if (isset($response['status']) && $response['status'] == 'OK')
+    {
+      $successCounter = count($recipients);
+      foreach ($recipients as $recipient)
+      {
+        $this->identifiers[$recipient] = $response['identifier'];
+      }
+    }
+    else
+    {
+      $successCounter = 0;
+      $failedRecipients=$recipients;
+    }
+
+    return $successCounter;
+  }
+
+  protected function sendToApi($parameters)
+  {
+    if (is_null($this->username) || is_null($this->password))
+    {
+      throw new Swift_TransportException('username and password must be set');
+    }
+
+    if (is_null($this->uri))
+    {
+      throw new Swift_TransportException('uri must be set');
+    }
+
+    try
+    {
       $ch = curl_init($this->uri);
 
       curl_setopt($ch, CURLOPT_POSTFIELDS, $parameters);
@@ -78,19 +159,12 @@ class tp_DeliverHqTransport implements Swift_Transport
       curl_setopt($ch, CURLOPT_USERPWD, $this->username . ':' . $this->password);
       $output = curl_exec($ch);
       curl_close($ch);
-
-      $response = json_decode($output, true);
-
-      $status = $response['status'];
-      if($status=='OK')
-      {
-        $successCounter++;
-      }
-      $this->identifiers[$recipient]= $response['identifier'];
+      return $output;
     }
-
-
-    return $successCounter;
+    catch (Exception $e)
+    {
+      throw new Swift_TransportException($e->getMessage());
+    }
   }
 
   /**
